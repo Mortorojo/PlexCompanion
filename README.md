@@ -29,26 +29,11 @@ That's it. Use your hotkey (`Alt+Q` by default) whenever Plex is open to toggle 
 
 ## Building from source
 
-The whole app is **one C# file** (`src/PlexCompanion.cs`, ~1,540 lines). It uses only the .NET Framework that ships with Windows — no NuGet packages, no build system.
+The whole app is **one C# file** (`src/PlexCompanion.cs`) using only the .NET
+Framework that ships with Windows — no NuGet packages, no build system.
 
-**To compile:**
-
-Double-click **`build.bat`** (or run `build.ps1` in PowerShell). The output appears at `dist\PlexCompanion.exe`.
-
-That's the entire build. If `build.bat` says `csc.exe not found`, you're missing the .NET Framework compiler — install the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (check the ".NET desktop development" workload) and try again.
-
-### Repository layout
-
-```
-src/
-  PlexCompanion.cs    ← the entire app (watcher, setup wizard, dialogs)
-  PlexCompanion.ico   ← the app icon
-build.bat             ← double-click to compile
-build.ps1             ← same, for PowerShell
-dist/
-  PlexCompanion.exe   ← build output (generated, not committed)
-LICENSE               ← MIT
-```
+See the **[`build/` folder](build/README.md)** for everything on compiling it
+(`build.bat` / `build.ps1`), requirements, and the layout.
 
 ## Where it stores settings
 

@@ -4,7 +4,7 @@
 #   Default: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 
 $ErrorActionPreference = "Stop"
-Set-Location -LiteralPath $PSScriptRoot
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..')
 
 $CSC = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $CSC)) {
