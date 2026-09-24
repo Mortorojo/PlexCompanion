@@ -527,7 +527,8 @@ static class Program
             File.Copy(Process.GetCurrentProcess().MainModule.FileName, target, true);
 
             var fwd = new List<string>();
-            for (int i = 0; i < args.Length; i++) fwd.Add("\"" + args[i] + "\"");
+            for (int i = 0; i < args.Length; i++)
+                fwd.Add("\"" + args[i].Replace("\"", "\\\"") + "\"");
             var psi = new ProcessStartInfo(target, string.Join(" ", fwd));
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -720,6 +721,27 @@ static class Program
         catch { return false; }
     }
 
+    // Single-quoted PowerShell string literal ('' escaping) — safe inside a script.
+    static string PSQ(string s)
+    {
+        return "'" + s.Replace("'", "''") + "'";
+    }
+
+    // Launch PowerShell with an encoded (UTF-16LE, Base64) command — the command
+    // line contains only Base64 characters, so no path content can be re-parsed
+    // by cmd or re-split by the shell (replaces the old injectable "cmd /c ..."
+    // string concatenations).
+    static Process StartPowerShell(string script, bool elevate)
+    {
+        string b64 = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+        var psi = new ProcessStartInfo("powershell.exe",
+            "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + b64);
+        psi.UseShellExecute = true;
+        if (elevate) psi.Verb = "runas";
+        psi.WindowStyle = ProcessWindowStyle.Hidden;
+        return Process.Start(psi);
+    }
+
     static bool InstallTo(string dir, string srcExe)
     {
         string target = Path.Combine(dir, "PlexCompanion.exe");
@@ -734,12 +756,9 @@ static class Program
         // needs rights (Program Files & co) — UAC-elevate the one step that writes
         try
         {
-            string args = "/c mkdir \"" + dir + "\" >nul 2>&1 & copy /y \"" + srcExe + "\" \"" + target + "\"";
-            var psi = new ProcessStartInfo("cmd.exe", args);
-            psi.UseShellExecute = true;
-            psi.Verb = "runas";
-            psi.WindowStyle = ProcessWindowStyle.Hidden;
-            Process pr = Process.Start(psi);
+            string script = "New-Item -ItemType Directory -Path " + PSQ(dir) + " -Force | Out-Null; " +
+                            "Copy-Item -LiteralPath " + PSQ(srcExe) + " -Destination " + PSQ(target) + " -Force";
+            Process pr = StartPowerShell(script, true);
             pr.WaitForExit(60000);
             return File.Exists(target);
         }
@@ -754,12 +773,10 @@ static class Program
     {
         try
         {
-            string args = "/c timeout /t 3 /nobreak >nul 2>&1 & rmdir /s /q \"" + dir + "\"";
-            var psi = new ProcessStartInfo("cmd.exe", args);
-            psi.UseShellExecute = true;
-            if (!TestWritable(dir)) psi.Verb = "runas";
-            psi.WindowStyle = ProcessWindowStyle.Hidden;
-            Process.Start(psi);
+            string script = "Start-Sleep -Seconds 3; " +
+                "if (Test-Path -LiteralPath " + PSQ(dir) + ") { " +
+                "Remove-Item -LiteralPath " + PSQ(dir) + " -Recurse -Force }";
+            StartPowerShell(script, !TestWritable(dir));
             Log.Write("scheduled folder delete -> " + dir);
         }
         catch (Exception ex) { Log.Write("folder delete failed: " + ex.Message); }
@@ -794,12 +811,10 @@ static class Program
             Environment.CurrentDirectory = Environment.GetEnvironmentVariable("TEMP") ?? root;
             try
             {
-                var psi = new ProcessStartInfo("cmd.exe",
-                    "/c timeout /t 3 /nobreak >nul 2>&1 & rmdir /s /q \"" + root + "\"");
-                psi.UseShellExecute = true;
-                if (!TestWritable(root)) psi.Verb = "runas";
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
-                Process.Start(psi);
+                string script = "Start-Sleep -Seconds 3; " +
+                    "if (Test-Path -LiteralPath " + PSQ(root) + ") { " +
+                    "Remove-Item -LiteralPath " + PSQ(root) + " -Recurse -Force }";
+                StartPowerShell(script, !TestWritable(root));
                 Log.Write("remove: scheduled folder self-delete -> " + root);
             }
             catch (Exception ex)
