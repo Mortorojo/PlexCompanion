@@ -266,6 +266,19 @@ class HiddenForm : Form
         this.Opacity = 0;
     }
 
+    // WS_EX_TOOLWINDOW: keeps this message-loop window out of the taskbar,
+    // the Alt+Tab list, and Task Manager's Applications tab (otherwise it
+    // appears there as a nameless entry with the default icon).
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x00000080;
+            return cp;
+        }
+    }
+
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == WM_HOTKEY && HotKey != null)
