@@ -117,6 +117,83 @@ static class Cfg
     const string UN  = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\PlexCompanion";
     const string RUN = @"Software\Microsoft\Windows\CurrentVersion\Run";
     public const string VERSION = "1.0.0";   // single source of truth — UI + Apps & Features
+    const string REPO = "Mortorojo/PlexCompanion";
+
+    // ---- update check (watcher startup only) ----
+    // Compare semver-ish versions; missing/extra segments count as 0.
+    public static bool NewerThan(string newer, string current)
+    {
+        int[] a = ParseVer(newer), b = ParseVer(current);
+        for (int i = 0; i < 3; i++)
+        {
+            if (a[i] != b[i]) return a[i] > b[i];
+        }
+        return false;
+    }
+    static int[] ParseVer(string v)
+    {
+        int[] r = { 0, 0, 0 };
+        if (string.IsNullOrEmpty(v)) return r;
+        v = v.Trim().TrimStart('v');
+        string[] parts = v.Split('.');
+        for (int i = 0; i < 3 && i < parts.Length; i++)
+        {
+            int x;
+            if (int.TryParse(parts[i], out x)) r[i] = x;
+        }
+        return r;
+    }
+    // "v1.0.1" -> "1.0.1"
+    public static string StripTag(string tag)
+    {
+        return (tag ?? "").Trim().TrimStart('v');
+    }
+    public class UpdateInfo { public string Tag; public string AssetUrl; }
+    // Fetch the latest release (tag + first asset download URL), or null
+    // (offline / repo gone / no release). ~5s hard cap so startup never hangs.
+    public static UpdateInfo LatestRelease()
+    {
+        try
+        {
+            UseTls12();
+            var req = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(
+                "https://api.github.com/repos/" + REPO + "/releases/latest");
+            req.KeepAlive = false;
+            req.Timeout = 5000;
+            req.UserAgent = "PlexCompanion/" + VERSION;
+            using (var resp = req.GetResponse())
+            using (var sr = new System.IO.StreamReader(resp.GetResponseStream()))
+            {
+                string body = sr.ReadToEnd();
+                var u = new UpdateInfo();
+                u.Tag = ExtractStr(body, "tag_name");
+                u.AssetUrl = ExtractStr(body, "browser_download_url");
+                return u.Tag != null ? u : null;
+            }
+        }
+        catch { return null; }
+    }
+    // .NET 4.0 defaults to TLS 1.0/1.1, which modern Windows disables — GitHub
+    // (and github.com asset downloads) need TLS 1.2, so force it on.
+    public static void UseTls12()
+    {
+        try { System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072; }
+        catch { }
+    }
+
+    // Pull a string field from the release JSON without a JSON library.
+    static string ExtractStr(string body, string key)
+    {
+        int i = body.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+        if (i < 0) return null;
+        i = body.IndexOf(":", i);
+        if (i < 0) return null;
+        i = body.IndexOf('"', i + 1);
+        if (i < 0) return null;
+        int j = body.IndexOf('"', i + 1);
+        if (j < 0) return null;
+        return body.Substring(i + 1, j - i - 1);
+    }
 
     public static string GetPlexPath()
     {
@@ -163,6 +240,16 @@ static class Cfg
             k.SetValue("HotMods", mods, RegistryValueKind.DWord);
             k.SetValue("HotVk", vk, RegistryValueKind.DWord);
         }
+    }
+    public static void SetAutoUpdate(bool on)
+    {
+        using (var k = Registry.CurrentUser.CreateSubKey(APP))
+            k.SetValue("AutoUpdate", on ? 1 : 0, RegistryValueKind.DWord);
+    }
+    public static bool GetAutoUpdate()
+    {
+        using (var k = Registry.CurrentUser.OpenSubKey(APP, false))
+            return k == null || k.GetValue("AutoUpdate") == null ? true : (int)(int)k.GetValue("AutoUpdate") != 0;
     }
 
     public static void RegisterApp(string exe, string root)
@@ -544,6 +631,8 @@ static class Program
         // ---- dispatch ----
         if (args.Any(a => string.Equals(a, "/remove", StringComparison.OrdinalIgnoreCase)))
             return RunRemove(root, exe);
+        if (args.Any(a => string.Equals(a, "/update", StringComparison.OrdinalIgnoreCase)))
+            return RunUpdateCheck(root, exe, true) ? 0 : 1;
         bool forceSetup = args.Any(a => string.Equals(a, "/setup", StringComparison.OrdinalIgnoreCase));
         Log.Write("==== starting (installed=" + amInstalled + ") ====");
 
@@ -610,6 +699,7 @@ static class Program
             Cfg.SetPlexPath(path);
             Cfg.SetAppearance(w.AppearanceValue);
             Cfg.SetHotKey(w.HotMods, w.HotVk);
+            Cfg.SetAutoUpdate(w.CheckForUpdates);
 
             // ---- optional relocate (page 2 install location) ----
             if (!string.IsNullOrEmpty(w.InstallLocation))
@@ -703,10 +793,120 @@ static class Program
             Log.Write("setup: complete - entering watcher loop (stays armed)");
         }
 
+        // ---- update check (once per watcher start; silent when offline / up to date) ----
+        if (Cfg.GetAutoUpdate() && RunUpdateCheck(root, exe, false))
+            return 0;   // update swap is running — exit so it can replace the exe
+
         // ---- enter the watcher loop ----
         var app = new App(appearance, root);
         app.Run();
         return 0;
+    }
+
+    // Check GitHub for a newer release. force=false (watcher startup): only shows
+    // a dialog when a newer version exists. force=true (/update, for testing):
+    // always shows a dialog (update offer or "up to date").
+    // Returns true when the update swap has been scheduled — the caller must
+    // then EXIT (not enter the watcher loop) so it releases the exe's image
+    // lock before the background copy overwrites it.
+    static bool RunUpdateCheck(string root, string exe, bool force)
+    {
+        var info = Cfg.LatestRelease();
+        if (info == null || info.Tag == null)
+        {
+            if (force)
+                MessageBox.Show("Couldn't reach the update server (offline, or no release published).",
+                    "PlexCompanion — Update check", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Log.Write("update check: no result (offline?)");
+            return false;
+        }
+        string newVer = Cfg.StripTag(info.Tag);
+        if (!Cfg.NewerThan(newVer, Cfg.VERSION) && !force)
+        {
+            Log.Write("update check: up to date (" + newVer + ")");
+            return false;
+        }
+        if (!Cfg.NewerThan(newVer, Cfg.VERSION))
+        {
+            MessageBox.Show("PlexCompanion is up to date (version " + newVer + ").",
+                "PlexCompanion — Update check", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        Log.Write("update check: newer release " + newVer + " (have " + Cfg.VERSION + ")");
+        var n = new UpdateNotice(newVer, Cfg.VERSION, info.AssetUrl);
+        if (n.ShowDialog() != DialogResult.OK)
+        {
+            Log.Write("update: user chose 'Later' - watcher keeps running");
+            return false;
+        }
+
+        // ---- download the new exe to a temp file ----
+        string tmp = Path.Combine(Path.GetTempPath(), "PlexCompanion-" + newVer + ".exe");
+        n.SetBusy("Downloading " + newVer + "…");
+        bool dl = DownloadExe(info.AssetUrl, tmp);
+        if (!dl)
+        {
+            n.SetBusy(null);
+            MessageBox.Show(n, "Download failed — check your connection and try again later.",
+                "PlexCompanion — Update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Write("update: download failed");
+            return false;
+        }
+        Log.Write("update: downloaded to " + tmp + " (" + new FileInfo(tmp).Length + " bytes)");
+
+        // ---- swap (fire-and-forget: the app exits right after this returns,
+        // dropping its own lock on the exe; the swap kills any remaining
+        // instances then retries the copy until it lands) ----
+        n.SetBusy("Installing " + newVer + "…");
+        string rootN = Path.GetFullPath(root).TrimEnd('\\');
+        string dest = Path.Combine(rootN, "PlexCompanion.exe");
+        string script =
+            "$dest = " + PSQ(dest) + "; $tmp = " + PSQ(tmp) + "; " +
+            "for ($i = 0; $i -lt 24; $i++) { " +
+            "  $p = Get-Process -Name PlexCompanion -ErrorAction SilentlyContinue; " +
+            "  if ($p) { $p | Stop-Process -Force -ErrorAction SilentlyContinue; " +
+            "  $p | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue; " +
+            "  Start-Sleep -Milliseconds 500 } " +
+            "  else { " +
+            "  try { Copy-Item -LiteralPath $tmp -Destination $dest -Force; " +
+            "  if ((Get-Item -LiteralPath $dest).Length -eq (Get-Item -LiteralPath $tmp).Length) { " +
+            "    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; " +
+            "    Start-Process -LiteralPath $dest; exit 0 } } catch { } } } " +
+            "exit 1";
+        try
+        {
+            StartPowerShell(script, !TestWritable(rootN));   // elevate only if the install folder isn't user-writable
+            Log.Write("update: swap launched, exiting to release the exe lock");
+        }
+        catch (Exception ex)
+        {
+            Log.Write("update: swap launch failed: " + ex.Message);
+            return false;
+        }
+        return true;
+    }
+
+    static bool DownloadExe(string url, string dest)
+    {
+        try
+        {
+            Cfg.UseTls12();
+            var req = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(url);
+            req.KeepAlive = false;
+            req.Timeout = 15000;
+            req.UserAgent = "PlexCompanion/" + Cfg.VERSION;
+            using (var resp = req.GetResponse())
+            using (var rs = resp.GetResponseStream())
+            using (var fs = new FileStream(dest, FileMode.Create))
+            {
+                byte[] buf = new byte[81920];
+                int n;
+                while ((n = rs.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+            }
+            return File.Exists(dest) && new FileInfo(dest).Length > 1000;
+        }
+        catch { return false; }
     }
 
     static bool TestWritable(string dir)
@@ -871,6 +1071,7 @@ public class SetupWindow : Form
   public string  AppearanceValue  { get; set; }
   public string  InstallLocation  { get; set; }
   public bool    LaunchPlex       { get; set; }
+  public bool    CheckForUpdates  { get; set; }
   public int     HotMods          { get; set; }
   public int     HotVk            { get; set; }
   public static readonly string WinIconB64 = "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";
@@ -891,7 +1092,7 @@ public class SetupWindow : Form
   TextBox   _plexPath;
   TextBox   _installPath;
   RBtn      _dark, _light;
-  GoldCheck _launch;
+  GoldCheck _launch, _updates;
   RBtn      _cancel, _next, _back, _installBtn;
   Label     _heading;
   HotKeyBox _hotkeyBox;
@@ -973,7 +1174,7 @@ public class SetupWindow : Form
     if (_apLabel != null) _apLabel.Visible = (page == 1);
     if (_helper != null) _helper.Visible = true;
     _instCard.Visible = (page == 2);
-    _launch.Visible = (page == 2);
+    _launch.Visible = _updates.Visible = (page == 2);
 
     _cancel.Visible = (page == 1);
     _next.Visible = (page == 1);
@@ -1155,9 +1356,14 @@ public class SetupWindow : Form
     change2.Click += delegate(object s, EventArgs e) { BrowseInstall(); };
     _instCard.Controls.Add(change2);
 
-    // ---- PAGE 2: LAUNCH CHECKBOX ----
+    // ---- PAGE 2: OPTIONS — auto-update check first, then launch Plex (pushed down) ----
+    _updates = new GoldCheck("Automatically check for updates");
+    _updates.Bounds = new Rectangle(x0, cardY + cardH + 26, 320, 30);
+    _updates.Checked = true;
+    this.Controls.Add(_updates);
+
     _launch = new GoldCheck("Start Plex after installation");
-    _launch.Bounds = new Rectangle(x0, cardY + cardH + 26, 320, 30);
+    _launch.Bounds = new Rectangle(x0, cardY + cardH + 64, 320, 30);
     _launch.Checked = true;
     this.Controls.Add(_launch);
 
@@ -1190,6 +1396,7 @@ public class SetupWindow : Form
       AppearanceValue = _darkSel ? "dark" : "light";
       InstallLocation = _isFirstRun ? dir : null;
       LaunchPlex = _launch.Checked;
+      CheckForUpdates = _updates.Checked;
       HotMods = _hotkeyBox.Mods;
       HotVk = _hotkeyBox.Vk;
       this.DialogResult = DialogResult.OK;
@@ -1562,5 +1769,103 @@ public class RemoveDone : Form
       try { if (this.IsHandleCreated) { int v = 1; P.DwmSetWindowAttribute(this.Handle, 20, ref v, 4); P.DwmSetWindowAttribute(this.Handle, 19, ref v, 4); } }
       catch { }
     };
+  }
+}
+// update-available dialog — same design language as the setup/remove dialogs.
+// "Update now" -> DialogResult.OK (caller then downloads + swaps); "Later" -> Cancel.
+public class UpdateNotice : Form
+{
+  static readonly Color Bg   = SetupWindow.Bg;
+  static readonly Color Srf  = SetupWindow.Srf;
+  static readonly Color Strk = SetupWindow.Strk;
+  static readonly Color Acc  = SetupWindow.Acc;
+  static readonly Color AccH = SetupWindow.AccH;
+  static readonly Color AccT = SetupWindow.AccT;
+  static readonly Color Tp   = SetupWindow.Tp;
+  static readonly Color Ts   = SetupWindow.Ts;
+
+  RBtn  _later;
+  Label _status;
+  bool  _busy;
+
+  public UpdateNotice(string newVersion, string currentVersion, string assetUrl)
+  {
+    this.Text = "PlexCompanion - Update available";
+    this.BackColor = Bg;
+    this.FormBorderStyle = FormBorderStyle.FixedDialog;
+    this.MaximizeBox = false;
+    this.MinimizeBox = false;
+    this.ShowInTaskbar = true;
+    this.ClientSize = new Size(400, 192);
+    this.StartPosition = FormStartPosition.CenterScreen;
+    this.DoubleBuffered = true;
+
+    try
+    {
+      byte[] icoRaw = System.Convert.FromBase64String(SetupWindow.WinIconB64);
+      using (MemoryStream icoMs = new MemoryStream(icoRaw))
+        this.Icon = new Icon(icoMs);
+    }
+    catch { /* icon is cosmetic */ }
+
+    Label h1 = new Label();
+    h1.Text = "Update available";
+    h1.Font = new Font("Segoe UI Semibold", 16f);
+    h1.ForeColor = Tp;
+    h1.AutoSize = false;
+    h1.TextAlign = ContentAlignment.MiddleCenter;
+    h1.Bounds = new Rectangle(0, 30, 400, 28);
+    this.Controls.Add(h1);
+
+    Label sub = new Label();
+    sub.Text = "Current version  v" + currentVersion + "\r\n" + "Update available  v" + newVersion;
+    sub.Font = new Font("Segoe UI", 10f);
+    sub.ForeColor = Ts;
+    sub.AutoSize = false;
+    sub.TextAlign = ContentAlignment.MiddleCenter;
+    sub.Bounds = new Rectangle(0, 60, 400, 40);
+    this.Controls.Add(sub);
+
+    _status = new Label();
+    _status.Font = new Font("Segoe UI", 9.5f);
+    _status.ForeColor = Ts;
+    _status.AutoSize = false;
+    _status.TextAlign = ContentAlignment.MiddleCenter;
+    _status.Bounds = new Rectangle(0, 104, 400, 22);
+    _status.Visible = false;
+    this.Controls.Add(_status);
+
+    RBtn later = new RBtn("Later", 60, 128, 120, 40, Srf, Color.FromArgb(0x23, 0x23, 0x29), Tp, Strk, false, Bg);
+    _later = later;
+    later.Click += delegate(object s, EventArgs e) { if (_busy) return; this.DialogResult = DialogResult.Cancel; this.Close(); };
+    this.Controls.Add(later);
+
+    RBtn update = new RBtn("Update now", 220, 128, 120, 40, Acc, AccH, AccT, Acc, true, Bg);
+    update.Click += delegate(object s, EventArgs e) { if (_busy) return; this.DialogResult = DialogResult.OK; this.Close(); };
+    this.Controls.Add(update);
+
+    this.KeyPreview = true;
+    this.KeyDown += delegate(object s, KeyEventArgs e)
+    {
+      if (_busy) return;
+      if (e.KeyCode == Keys.Enter)  { this.DialogResult = DialogResult.OK; this.Close(); e.Handled = true; }
+      if (e.KeyCode == Keys.Escape) { this.DialogResult = DialogResult.Cancel; this.Close(); e.Handled = true; }
+    };
+
+    this.Load += delegate(object s, EventArgs e)
+    {
+      try { if (this.IsHandleCreated) { int v = 1; P.DwmSetWindowAttribute(this.Handle, 20, ref v, 4); P.DwmSetWindowAttribute(this.Handle, 19, ref v, 4); } }
+      catch { }
+    };
+  }
+
+  // Show progress text during download/install; null hides it.
+  public void SetBusy(string text)
+  {
+    _busy = text != null;
+    _status.Text = text ?? "";
+    _status.Visible = !string.IsNullOrEmpty(text);
+    _later.Enabled = !_busy;
+    Update();
   }
 }
