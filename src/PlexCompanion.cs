@@ -1,4 +1,4 @@
-﻿// PlexCompanion v1.0.0 — single-file C# (.NET Framework 4) app for Plex for Windows.
+﻿// PlexCompanion v1.0.1 — single-file C# (.NET Framework 4) app for Plex for Windows.
 // One exe, one process: setup wizard, background watcher, and uninstaller all live here.
 //
 // Build: double-click build.bat (or run build.ps1) — see README for details.
@@ -116,7 +116,7 @@ static class Cfg
     const string APP = @"Software\PlexCompanion";
     const string UN  = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\PlexCompanion";
     const string RUN = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    public const string VERSION = "1.0.0";   // single source of truth — UI + Apps & Features
+    public const string VERSION = "1.0.1";   // single source of truth — UI + Apps & Features
     const string REPO = "Mortorojo/PlexCompanion";
 
     // ---- update check (watcher startup only) ----
